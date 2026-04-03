@@ -1,179 +1,201 @@
 ###############################################################################
 # FULLY AUTOMATED OIC-to-OIC INTEGRATION MIGRATION
 #
-# - No manual inputs required
-# - Discovers all integrations in source OIC automatically
-# - Exports each integration as .iar
-# - Imports each integration into target OIC
-# - Validates every step with clear error messages
-# - Handles conflicts, retries, and edge cases
+# - Discovers integrations in source OIC (paged)
+# - Exports each as .iar, imports to target, optional deactivate/activate
+# - Retries on transient errors
 #
-# Triggers: push to main, scheduled nightly, or manual
+# Auth: HTTP Basic (username + password) against OIC REST API.
+#
+# Design-time hosts (https://design.integration.<region>.ocp.oraclecloud.com):
+#   Set SOURCE_OIC_INSTANCE / TARGET_OIC_INSTANCE to the service instance name
+#   (?integrationInstance=... in the browser). Leave blank for service-console
+#   hostnames where the instance is in the URL.
+#
+# Triggers: push to main (config change), schedule, workflow_dispatch
 ###############################################################################
-
+ 
 name: "OIC Auto-Migration (Source → Target)"
-
+ 
 on:
   push:
     branches: [main]
     paths:
       - "config/migration-config.json"
   schedule:
-    # Run every day at 2:00 AM UTC (adjust as needed)
     - cron: "0 2 * * *"
   workflow_dispatch: {}
-
+ 
 concurrency:
   group: oic-auto-migration
   cancel-in-progress: false
-
+ 
 env:
   API_TIMEOUT: 120
   MAX_RETRIES: 3
   RETRY_DELAY: 15
   EXPORT_DIR: "oic_exports"
-
+ 
 jobs:
-  ##############################################################################
-  # JOB 1: VALIDATE ENVIRONMENT & CONNECTIVITY
-  ##############################################################################
   validate-environment:
     name: "1 ─ Validate Environment"
     runs-on: ubuntu-latest
     outputs:
       source_url: ${{ steps.urls.outputs.source_url }}
       target_url: ${{ steps.urls.outputs.target_url }}
-
+      source_instance: ${{ steps.urls.outputs.source_instance }}
+      target_instance: ${{ steps.urls.outputs.target_instance }}
+ 
     steps:
-      # ── Check all secrets exist ──
-      - name: "Check: All required secrets are configured"
+      - name: "Check required secrets"
         run: |
           echo "=========================================="
           echo "  CHECKING REQUIRED SECRETS"
           echo "=========================================="
           FAIL=false
-
+ 
           check_secret() {
-            local name="\$1"
-            local value="\$2"
-            if [ -z "$value" ]; then
-              echo "::error::❌ Secret '$name' is NOT configured."
+            local n="$1"
+            local v="$2"
+            if [ -z "$v" ]; then
+              echo "::error::Secret '$n' is NOT configured."
               FAIL=true
             else
-              echo "  ✅ $name is set"
+              echo "  ✅ $n is set"
             fi
           }
-
-          check_secret "SOURCE_OIC_HOST"     "${{ secrets.SOURCE_OIC_HOST }}"
-          check_secret "SOURCE_OIC_USERNAME"  "${{ secrets.SOURCE_OIC_USERNAME }}"
-          check_secret "SOURCE_OIC_PASSWORD"  "${{ secrets.SOURCE_OIC_PASSWORD }}"
-          check_secret "TARGET_OIC_HOST"      "${{ secrets.TARGET_OIC_HOST }}"
-          check_secret "TARGET_OIC_USERNAME"  "${{ secrets.TARGET_OIC_USERNAME }}"
-          check_secret "TARGET_OIC_PASSWORD"  "${{ secrets.TARGET_OIC_PASSWORD }}"
-
+ 
+          check_secret "SOURCE_OIC_HOST" "${{ secrets.SOURCE_OIC_HOST }}"
+          check_secret "SOURCE_OIC_USERNAME" "${{ secrets.SOURCE_OIC_USERNAME }}"
+          check_secret "SOURCE_OIC_PASSWORD" "${{ secrets.SOURCE_OIC_PASSWORD }}"
+          check_secret "TARGET_OIC_HOST" "${{ secrets.TARGET_OIC_HOST }}"
+          check_secret "TARGET_OIC_USERNAME" "${{ secrets.TARGET_OIC_USERNAME }}"
+          check_secret "TARGET_OIC_PASSWORD" "${{ secrets.TARGET_OIC_PASSWORD }}"
+ 
           if [ "$FAIL" = true ]; then
             echo ""
-            echo "::error::One or more required secrets are missing. Go to Settings → Secrets and variables → Actions to add them."
+            echo "::error::Add missing secrets under Settings → Secrets and variables → Actions."
             exit 1
           fi
           echo ""
-          echo "✅ All secrets present."
-
-      # ── Build base URLs ──
-      - name: "Build OIC REST API base URLs"
+          echo "✅ All required secrets present."
+          echo "ℹ️  SOURCE_OIC_INSTANCE / TARGET_OIC_INSTANCE are optional (required for design-time URL)."
+ 
+      - name: "Build OIC REST base URLs"
         id: urls
         run: |
           build_url() {
-            local host="\$1"
+            local host="$1"
             host="${host%/}"
-            [[ "$$host" != https://* ]] && host="https://$$host"
+            [[ "$host" != https://* ]] && host="https://${host}"
             echo "${host}/ic/api/integration/v1"
           }
-
-          SOURCE_URL=$$(build_url "$${{ secrets.SOURCE_OIC_HOST }}")
-          TARGET_URL=$$(build_url "$${{ secrets.TARGET_OIC_HOST }}")
-
+ 
+          SOURCE_URL=$(build_url "${{ secrets.SOURCE_OIC_HOST }}")
+          TARGET_URL=$(build_url "${{ secrets.TARGET_OIC_HOST }}")
+ 
           echo "Source API: $SOURCE_URL"
           echo "Target API: $TARGET_URL"
-
-          echo "source_url=$$SOURCE_URL" >> "$$GITHUB_OUTPUT"
-          echo "target_url=$$TARGET_URL" >> "$$GITHUB_OUTPUT"
-
-      # ── Test Source connectivity ──
-      - name: "Check: Source OIC connectivity & authentication"
+ 
+          echo "source_url=$SOURCE_URL" >> "$GITHUB_OUTPUT"
+          echo "target_url=$TARGET_URL" >> "$GITHUB_OUTPUT"
+          echo "source_instance=${{ secrets.SOURCE_OIC_INSTANCE }}" >> "$GITHUB_OUTPUT"
+          echo "target_instance=${{ secrets.TARGET_OIC_INSTANCE }}" >> "$GITHUB_OUTPUT"
+ 
+      - name: "Check source OIC connectivity"
+        env:
+          SOURCE_URL: ${{ steps.urls.outputs.source_url }}
+          SRC_INST: ${{ steps.urls.outputs.source_instance }}
         run: |
           echo "=========================================="
           echo "  TESTING SOURCE OIC"
           echo "=========================================="
-          URL="${{ steps.urls.outputs.source_url }}/integrations?limit=1"
-
-          for i in $$(seq 1 $$MAX_RETRIES); do
+ 
+          if [ -n "$SRC_INST" ]; then
+            URL="${SOURCE_URL}/integrations?integrationInstance=${SRC_INST}&limit=1"
+          else
+            URL="${SOURCE_URL}/integrations?limit=1"
+          fi
+ 
+          for i in $(seq 1 "$MAX_RETRIES"); do
             HTTP=$(curl -s -o /tmp/src.json -w "%{http_code}" \
-              --max-time $API_TIMEOUT \
-              -u "$${{ secrets.SOURCE_OIC_USERNAME }}:$${{ secrets.SOURCE_OIC_PASSWORD }}" \
+              --max-time "$API_TIMEOUT" \
+              -u "${{ secrets.SOURCE_OIC_USERNAME }}:${{ secrets.SOURCE_OIC_PASSWORD }}" \
               -H "Accept: application/json" "$URL" 2>/tmp/src_err.txt)
             EC=$?
-
-            [ $EC -ne 0 ] && {
-              echo "::warning::Curl error (attempt $$i): $$(cat /tmp/src_err.txt)"
-              [ $$i -lt $$MAX_RETRIES ] && sleep $RETRY_DELAY && continue
-              echo "::error::❌ Cannot reach Source OIC after $MAX_RETRIES attempts. Check SOURCE_OIC_HOST, network/firewall, and DNS."
+ 
+            if [ "$EC" -ne 0 ]; then
+              echo "::warning::Curl error (attempt $i): $(cat /tmp/src_err.txt)"
+              [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
+              echo "::error::Cannot reach source OIC after $MAX_RETRIES attempts."
               exit 1
-            }
-
+            fi
+ 
             case "$HTTP" in
-              200) echo "✅ Source OIC reachable, credentials valid."; break ;;
-              401) echo "::error::❌ Source OIC returned 401 Unauthorized. Check SOURCE_OIC_USERNAME / SOURCE_OIC_PASSWORD."; exit 1 ;;
-              403) echo "::error::❌ Source OIC returned 403 Forbidden. User lacks REST API access."; exit 1 ;;
-              404) echo "::error::❌ Source OIC returned 404. Verify SOURCE_OIC_HOST points to a valid OIC instance."; exit 1 ;;
+              200) echo "✅ Source OIC reachable."; break ;;
+              401) echo "::error::Source returned 401 — check SOURCE_OIC_USERNAME / SOURCE_OIC_PASSWORD."; exit 1 ;;
+              403) echo "::error::Source returned 403 — user lacks REST API access."; exit 1 ;;
+              404)
+                echo "::error::Source returned 404 — check SOURCE_OIC_HOST and SOURCE_OIC_INSTANCE (design-time)."
+                exit 1
+                ;;
               500|502|503|504)
-                echo "::warning::Source OIC returned $$HTTP (attempt $$i)."
-                [ $$i -lt $$MAX_RETRIES ] && sleep $RETRY_DELAY && continue
-                echo "::error::❌ Source OIC server error ($$HTTP) after $$MAX_RETRIES attempts."
-                exit 1 ;;
-              *) echo "::error::❌ Unexpected HTTP $HTTP from Source OIC."; cat /tmp/src.json; exit 1 ;;
+                echo "::warning::Source returned $HTTP (attempt $i)."
+                [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
+                echo "::error::Source server error ($HTTP)."
+                exit 1
+                ;;
+              *) echo "::error::Unexpected HTTP $HTTP from source."; cat /tmp/src.json; exit 1 ;;
             esac
           done
-
-      # ── Test Target connectivity ──
-      - name: "Check: Target OIC connectivity & authentication"
+ 
+      - name: "Check target OIC connectivity"
+        env:
+          TARGET_URL: ${{ steps.urls.outputs.target_url }}
+          TGT_INST: ${{ steps.urls.outputs.target_instance }}
         run: |
           echo "=========================================="
           echo "  TESTING TARGET OIC"
           echo "=========================================="
-          URL="${{ steps.urls.outputs.target_url }}/integrations?limit=1"
-
-          for i in $$(seq 1 $$MAX_RETRIES); do
+ 
+          if [ -n "$TGT_INST" ]; then
+            URL="${TARGET_URL}/integrations?integrationInstance=${TGT_INST}&limit=1"
+          else
+            URL="${TARGET_URL}/integrations?limit=1"
+          fi
+ 
+          for i in $(seq 1 "$MAX_RETRIES"); do
             HTTP=$(curl -s -o /tmp/tgt.json -w "%{http_code}" \
-              --max-time $API_TIMEOUT \
-              -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
+              --max-time "$API_TIMEOUT" \
+              -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
               -H "Accept: application/json" "$URL" 2>/tmp/tgt_err.txt)
             EC=$?
-
-            [ $EC -ne 0 ] && {
-              echo "::warning::Curl error (attempt $$i): $$(cat /tmp/tgt_err.txt)"
-              [ $$i -lt $$MAX_RETRIES ] && sleep $RETRY_DELAY && continue
-              echo "::error::❌ Cannot reach Target OIC after $MAX_RETRIES attempts. Check TARGET_OIC_HOST, network/firewall, and DNS."
+ 
+            if [ "$EC" -ne 0 ]; then
+              echo "::warning::Curl error (attempt $i): $(cat /tmp/tgt_err.txt)"
+              [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
+              echo "::error::Cannot reach target OIC after $MAX_RETRIES attempts."
               exit 1
-            }
-
+            fi
+ 
             case "$HTTP" in
-              200) echo "✅ Target OIC reachable, credentials valid."; break ;;
-              401) echo "::error::❌ Target OIC returned 401 Unauthorized. Check TARGET_OIC_USERNAME / TARGET_OIC_PASSWORD."; exit 1 ;;
-              403) echo "::error::❌ Target OIC returned 403 Forbidden. User lacks REST API access."; exit 1 ;;
-              404) echo "::error::❌ Target OIC returned 404. Verify TARGET_OIC_HOST."; exit 1 ;;
+              200) echo "✅ Target OIC reachable."; break ;;
+              401) echo "::error::Target returned 401."; exit 1 ;;
+              403) echo "::error::Target returned 403."; exit 1 ;;
+              404)
+                echo "::error::Target returned 404 — check TARGET_OIC_HOST and TARGET_OIC_INSTANCE."
+                exit 1
+                ;;
               500|502|503|504)
-                echo "::warning::Target OIC returned $$HTTP (attempt $$i)."
-                [ $$i -lt $$MAX_RETRIES ] && sleep $RETRY_DELAY && continue
-                echo "::error::❌ Target OIC server error ($$HTTP) after $$MAX_RETRIES attempts."
-                exit 1 ;;
-              *) echo "::error::❌ Unexpected HTTP $HTTP from Target OIC."; cat /tmp/tgt.json; exit 1 ;;
+                echo "::warning::Target returned $HTTP (attempt $i)."
+                [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
+                echo "::error::Target server error ($HTTP)."
+                exit 1
+                ;;
+              *) echo "::error::Unexpected HTTP $HTTP from target."; cat /tmp/tgt.json; exit 1 ;;
             esac
           done
-
-  ##############################################################################
-  # JOB 2: DISCOVER ALL INTEGRATIONS IN SOURCE
-  ##############################################################################
+ 
   discover-integrations:
     name: "2 ─ Discover Source Integrations"
     runs-on: ubuntu-latest
@@ -181,677 +203,459 @@ jobs:
     outputs:
       matrix: ${{ steps.build-matrix.outputs.matrix }}
       count: ${{ steps.build-matrix.outputs.count }}
-
+ 
     steps:
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
-
-      - name: "Fetch all integrations from Source OIC"
+ 
+      - name: "Fetch integrations (paged)"
         id: build-matrix
+        env:
+          SOURCE_URL: ${{ needs.validate-environment.outputs.source_url }}
+          SRC_INST: ${{ needs.validate-environment.outputs.source_instance }}
         run: |
           echo "=========================================="
-          echo "  DISCOVERING INTEGRATIONS IN SOURCE OIC"
+          echo "  DISCOVERING INTEGRATIONS"
           echo "=========================================="
-
-          SOURCE_URL="${{ needs.validate-environment.outputs.source_url }}"
-          ALL_INTEGRATIONS="[]"
+ 
+          ALL='[]'
           OFFSET=0
           LIMIT=100
-          HAS_MORE=true
           PAGE=1
-
-          while [ "$HAS_MORE" = "true" ]; do
-            echo "Fetching page $$PAGE (offset=$$OFFSET, limit=$LIMIT)..."
-
+ 
+          while true; do
+            echo "Fetching page $PAGE (offset=$OFFSET)..."
+ 
+            if [ -n "$SRC_INST" ]; then
+              LIST_URL="${SOURCE_URL}/integrations?integrationInstance=${SRC_INST}&limit=${LIMIT}&offset=${OFFSET}"
+            else
+              LIST_URL="${SOURCE_URL}/integrations?limit=${LIMIT}&offset=${OFFSET}"
+            fi
+ 
             HTTP=$(curl -s -o /tmp/page.json -w "%{http_code}" \
-              --max-time ${{ env.API_TIMEOUT }} \
-              -u "$${{ secrets.SOURCE_OIC_USERNAME }}:$${{ secrets.SOURCE_OIC_PASSWORD }}" \
+              --max-time "$API_TIMEOUT" \
+              -u "${{ secrets.SOURCE_OIC_USERNAME }}:${{ secrets.SOURCE_OIC_PASSWORD }}" \
               -H "Accept: application/json" \
-              "$${SOURCE_URL}/integrations?limit=$${LIMIT}&offset=${OFFSET}" 2>/tmp/page_err.txt)
-
+              "$LIST_URL" 2>/tmp/page_err.txt)
             EC=$?
-
-            if [ $EC -ne 0 ]; then
-              echo "::error::❌ Curl failed fetching integrations (page $$PAGE). Error: $$(cat /tmp/page_err.txt)"
+ 
+            if [ "$EC" -ne 0 ]; then
+              echo "::error::Curl failed page $PAGE: $(cat /tmp/page_err.txt)"
               exit 1
             fi
-
+ 
             if [ "$HTTP" != "200" ]; then
-              echo "::error::❌ Failed to list integrations (HTTP $$HTTP, page $$PAGE)."
-              cat /tmp/page.json 2>/dev/null
+              echo "::error::List failed HTTP $HTTP page $PAGE"
+              cat /tmp/page.json 2>/dev/null || true
               exit 1
             fi
-
-            # Validate JSON
+ 
             if ! jq empty /tmp/page.json 2>/dev/null; then
-              echo "::error::❌ Invalid JSON response on page $PAGE."
+              echo "::error::Invalid JSON on page $PAGE"
               head -c 500 /tmp/page.json
               exit 1
             fi
-
-            # Extract items
-            ITEMS=$(jq -r '.items // []' /tmp/page.json)
-            ITEM_COUNT=$$(echo "$$ITEMS" | jq 'length')
-
-            echo "  Page $$PAGE: found $$ITEM_COUNT integrations"
-
-            # Build entries: { id, version, name, status }
-            PAGE_ENTRIES=$$(echo "$$ITEMS" | jq '[.[] | {
+ 
+            ITEMS=$(jq -c '.items // []' /tmp/page.json)
+            ITEM_COUNT=$(echo "$ITEMS" | jq 'length')
+            echo "  Page $PAGE: $ITEM_COUNT items"
+ 
+            PAGE_ENTRIES=$(echo "$ITEMS" | jq -c '[.[] | {
               id: (.id // .code // .identifier),
               version: .version,
               name: (.name // "unknown"),
               status: (.status // "UNKNOWN")
             }]')
-
-            ALL_INTEGRATIONS=$$(echo "$$ALL_INTEGRATIONS" "$PAGE_ENTRIES" | jq -s '.[0] + .[1]')
-
-            # Check if more pages
-            if [ "$$ITEM_COUNT" -lt "$$LIMIT" ]; then
-              HAS_MORE=false
-            else
-              OFFSET=$((OFFSET + LIMIT))
-              PAGE=$((PAGE + 1))
+ 
+            ALL=$(jq -s '.[0] + .[1]' <(echo "$ALL") <(echo "$PAGE_ENTRIES"))
+ 
+            if [ "$ITEM_COUNT" -lt "$LIMIT" ]; then
+              break
             fi
+            OFFSET=$((OFFSET + LIMIT))
+            PAGE=$((PAGE + 1))
           done
-
-          TOTAL=$$(echo "$$ALL_INTEGRATIONS" | jq 'length')
+ 
+          TOTAL=$(echo "$ALL" | jq 'length')
           echo ""
-          echo "=========================================="
-          echo "  TOTAL INTEGRATIONS FOUND: $TOTAL"
-          echo "=========================================="
-
+          echo "TOTAL INTEGRATIONS: $TOTAL"
+ 
           if [ "$TOTAL" -eq 0 ]; then
-            echo "::error::❌ No integrations found in Source OIC. Nothing to migrate."
+            echo "::error::No integrations found in source."
             exit 1
           fi
-
-          # List all discovered integrations
-          echo ""
-          echo "$ALL_INTEGRATIONS" | jq -r '.[] | "  [\(.status)] \(.id) v\(.version)  —  \(.name)"'
-          echo ""
-
-          # Build matrix JSON for the next job
-          MATRIX=$$(echo "$$ALL_INTEGRATIONS" | jq -c '{include: .}')
-
-          echo "count=$$TOTAL" >> "$$GITHUB_OUTPUT"
-          echo "matrix=$$MATRIX" >> "$$GITHUB_OUTPUT"
-
-  ##############################################################################
-  # JOB 3: EXPORT → IMPORT EACH INTEGRATION (parallel matrix)
-  ##############################################################################
+ 
+          echo "$ALL" | jq -r '.[] | "  [\(.status)] \(.id) v\(.version) — \(.name)"'
+ 
+          MATRIX=$(echo "$ALL" | jq -c '{include: .}')
+          echo "count=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+ 
   migrate-integration:
-    name: "3 ─ Migrate: $${{ matrix.id }} v$${{ matrix.version }}"
+    name: "3 — ${{ matrix.id }} v${{ matrix.version }}"
     runs-on: ubuntu-latest
     needs: [validate-environment, discover-integrations]
     strategy:
       matrix: ${{ fromJson(needs.discover-integrations.outputs.matrix) }}
-      fail-fast: false     # Don't stop other migrations if one fails
-      max-parallel: 3      # Limit parallel API calls to avoid throttling
-
+      fail-fast: false
+      max-parallel: 3
+ 
     steps:
-      - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq curl file
-
-      # ── STEP A: Validate this integration in source ──
-      - name: "Validate: $${{ matrix.id }} v$${{ matrix.version }} exists in source"
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq curl file unzip
+ 
+      - name: "Validate source"
         id: validate-source
+        env:
+          SOURCE_URL: ${{ needs.validate-environment.outputs.source_url }}
+          SRC_INST: ${{ needs.validate-environment.outputs.source_instance }}
         run: |
-          echo "=========================================="
-          echo "  VALIDATE SOURCE: $${{ matrix.id }} v$${{ matrix.version }}"
-          echo "=========================================="
-
-          SOURCE_URL="${{ needs.validate-environment.outputs.source_url }}"
           INT_ID="${{ matrix.id }}"
           INT_VER="${{ matrix.version }}"
-          ENCODED="$${INT_ID}%7C$${INT_VER}"
-
+          ENCODED=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]+"|"+sys.argv[2], safe=""))' "$INT_ID" "$INT_VER")
+ 
+          if [ -n "$SRC_INST" ]; then
+            VURL="${SOURCE_URL}/integrations/${ENCODED}?integrationInstance=${SRC_INST}"
+          else
+            VURL="${SOURCE_URL}/integrations/${ENCODED}"
+          fi
+ 
           HTTP=$(curl -s -o /tmp/val_src.json -w "%{http_code}" \
-            --max-time ${{ env.API_TIMEOUT }} \
-            -u "$${{ secrets.SOURCE_OIC_USERNAME }}:$${{ secrets.SOURCE_OIC_PASSWORD }}" \
-            -H "Accept: application/json" \
-            "$${SOURCE_URL}/integrations/$${ENCODED}")
-
+            --max-time "$API_TIMEOUT" \
+            -u "${{ secrets.SOURCE_OIC_USERNAME }}:${{ secrets.SOURCE_OIC_PASSWORD }}" \
+            -H "Accept: application/json" "$VURL")
+ 
           case "$HTTP" in
             200)
-              echo "✅ Integration confirmed in source."
+              echo "✅ Found in source."
               SRC_STATUS=$(jq -r '.status // "UNKNOWN"' /tmp/val_src.json)
-              SRC_PATTERN=$(jq -r '.pattern // "UNKNOWN"' /tmp/val_src.json)
-              echo "  Status:  $SRC_STATUS"
-              echo "  Pattern: $SRC_PATTERN"
-              echo "source_status=$$SRC_STATUS" >> "$$GITHUB_OUTPUT"
+              echo "source_status=$SRC_STATUS" >> "$GITHUB_OUTPUT"
               ;;
-            404)
-              echo "::error::❌ [${{ matrix.id }}] Integration NOT FOUND in source. It may have been deleted after discovery."
-              exit 1
-              ;;
-            401)
-              echo "::error::❌ [${{ matrix.id }}] Authentication failure (401) when validating in source."
-              exit 1
-              ;;
-            *)
-              echo "::error::❌ [$${{ matrix.id }}] Unexpected HTTP $$HTTP when validating source."
-              cat /tmp/val_src.json 2>/dev/null
-              exit 1
-              ;;
+            404) echo "::error::Not found in source: $INT_ID"; exit 1 ;;
+            401) echo "::error::401 validating source"; exit 1 ;;
+            *) echo "::error::HTTP $HTTP validating source"; cat /tmp/val_src.json; exit 1 ;;
           esac
-
-      # ── STEP B: Export .iar from source ──
-      - name: "Export: $${{ matrix.id }} v$${{ matrix.version }}"
+ 
+      - name: "Export .iar"
         id: export
+        env:
+          SOURCE_URL: ${{ needs.validate-environment.outputs.source_url }}
+          SRC_INST: ${{ needs.validate-environment.outputs.source_instance }}
         run: |
-          echo "=========================================="
-          echo "  EXPORT: $${{ matrix.id }} v$${{ matrix.version }}"
-          echo "=========================================="
-
-          SOURCE_URL="${{ needs.validate-environment.outputs.source_url }}"
           INT_ID="${{ matrix.id }}"
           INT_VER="${{ matrix.version }}"
-          ENCODED="$${INT_ID}%7C$${INT_VER}"
-
-          mkdir -p ${{ env.EXPORT_DIR }}
-          FILE="$${{ env.EXPORT_DIR }}/$${INT_ID}_${INT_VER}.iar"
-
+          ENCODED=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]+"|"+sys.argv[2], safe=""))' "$INT_ID" "$INT_VER")
+          mkdir -p "$EXPORT_DIR"
+          FILE="${EXPORT_DIR}/${INT_ID}_${INT_VER}.iar"
+ 
           SUCCESS=false
-          for i in $$(seq 1 $${{ env.MAX_RETRIES }}); do
-            echo "  Export attempt $$i/$${{ env.MAX_RETRIES }}..."
-
-            HTTP=$$(curl -s -o "$$FILE" -w "%{http_code}" \
+          for i in $(seq 1 "$MAX_RETRIES"); do
+            if [ -n "$SRC_INST" ]; then
+              EURL="${SOURCE_URL}/integrations/${ENCODED}/archive?integrationInstance=${SRC_INST}"
+            else
+              EURL="${SOURCE_URL}/integrations/${ENCODED}/archive"
+            fi
+ 
+            HTTP=$(curl -s -L -o "$FILE" -w "%{http_code}" \
               --max-time 300 \
-              -u "$${{ secrets.SOURCE_OIC_USERNAME }}:$${{ secrets.SOURCE_OIC_PASSWORD }}" \
+              -u "${{ secrets.SOURCE_OIC_USERNAME }}:${{ secrets.SOURCE_OIC_PASSWORD }}" \
               -H "Accept: application/octet-stream" \
-              "$${SOURCE_URL}/integrations/$${ENCODED}/archive" 2>/tmp/exp_err.txt)
+              "$EURL" 2>/tmp/exp_err.txt)
             EC=$?
-
-            if [ $EC -ne 0 ]; then
-              echo "::warning::[$${{ matrix.id }}] Curl error (attempt $$i): $(cat /tmp/exp_err.txt)"
-              [ $$i -lt $${{ env.MAX_RETRIES }} ] && sleep ${{ env.RETRY_DELAY }} && continue
-              echo "::error::❌ [$${{ matrix.id }}] Export failed — network/curl error after $${{ env.MAX_RETRIES }} attempts."
+ 
+            if [ "$EC" -ne 0 ]; then
+              echo "::warning::Export curl error (attempt $i): $(cat /tmp/exp_err.txt)"
+              [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
               exit 1
             fi
-
+ 
             case "$HTTP" in
-              200)
-                SUCCESS=true
-                echo "  ✅ Export HTTP 200."
-                break
-                ;;
-              401)
-                echo "::error::❌ [${{ matrix.id }}] Export failed — 401 Unauthorized."
-                exit 1
-                ;;
-              403)
-                echo "::error::❌ [${{ matrix.id }}] Export failed — 403 Forbidden. User lacks export permission."
-                exit 1
-                ;;
-              404)
-                echo "::error::❌ [${{ matrix.id }}] Export failed — 404 Not Found."
-                exit 1
-                ;;
+              200) SUCCESS=true; break ;;
               409)
-                echo "::warning::[${{ matrix.id }}] Export conflict (409). Retrying..."
-                [ $$i -lt $${{ env.MAX_RETRIES }} ] && sleep ${{ env.RETRY_DELAY }} && continue
-                echo "::error::❌ [$${{ matrix.id }}] Export conflict not resolved after $${{ env.MAX_RETRIES }} attempts."
+                echo "::warning::409 conflict, retrying..."
+                [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
                 exit 1
                 ;;
               500|502|503|504)
-                echo "::warning::[$${{ matrix.id }}] Export server error ($$HTTP, attempt $i)."
-                [ $$i -lt $${{ env.MAX_RETRIES }} ] && sleep $(( RETRY_DELAY * i )) && continue
-                echo "::error::❌ [$${{ matrix.id }}] Export server error after $${{ env.MAX_RETRIES }} attempts."
+                [ "$i" -lt "$MAX_RETRIES" ] && sleep $((RETRY_DELAY * i)) && continue
                 exit 1
                 ;;
-              *)
-                echo "::error::❌ [$${{ matrix.id }}] Export unexpected HTTP $$HTTP."
-                # If response is text, it's an error body
-                file "$$FILE" | grep -qi text && cat "$$FILE"
-                exit 1
-                ;;
+              *) echo "::error::Export HTTP $HTTP"; head -c 800 "$FILE"; exit 1 ;;
             esac
           done
-
-          [ "$$SUCCESS" != "true" ] && { echo "::error::❌ [$${{ matrix.id }}] Export failed."; exit 1; }
-          echo "export_file=$$FILE" >> "$$GITHUB_OUTPUT"
-
-      # ── STEP C: Validate the exported .iar ──
-      - name: "Validate export: ${{ matrix.id }}"
+ 
+          [ "$SUCCESS" = true ] || exit 1
+          echo "export_file=$FILE" >> "$GITHUB_OUTPUT"
+ 
+      - name: "Validate export file"
         run: |
-          echo "=========================================="
-          echo "  VALIDATE EXPORT FILE"
-          echo "=========================================="
-
           FILE="${{ steps.export.outputs.export_file }}"
-
-          # File exists?
-          if [ ! -f "$FILE" ]; then
-            echo "::error::❌ [$${{ matrix.id }}] Export file missing at $$FILE."
-            exit 1
-          fi
-
-          # File size
-          SIZE=$$(stat -c%s "$$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null)
-          echo "  File size: $SIZE bytes"
-
-          if [ "$SIZE" -lt 100 ]; then
-            echo "::error::❌ [$${{ matrix.id }}] Export file too small ($$SIZE bytes). Likely an error response:"
-            cat "$FILE"
-            exit 1
-          fi
-
-          # File type — must be a ZIP archive, not text/JSON/HTML
-          TYPE=$$(file "$$FILE")
-          echo "  File type: $TYPE"
-
+          [ -f "$FILE" ] || { echo "::error::Missing export file"; exit 1; }
+          SIZE=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE")
+          echo "Size: $SIZE bytes"
+          [ "$SIZE" -ge 100 ] || { echo "::error::File too small"; cat "$FILE"; exit 1; }
+          TYPE=$(file "$FILE")
+          echo "$TYPE"
           if echo "$TYPE" | grep -qiE "text|json|xml|html"; then
-            echo "::error::❌ [${{ matrix.id }}] Export file is text, not a binary archive. Content:"
+            echo "::error::Response is not a binary archive"
             head -c 500 "$FILE"
             exit 1
           fi
-
-          if echo "$TYPE" | grep -qiE "zip|archive|jar|octet"; then
-            echo "  ✅ File is a valid archive."
-          else
-            echo "::warning::[${{ matrix.id }}] Could not confirm archive type. Proceeding cautiously."
-          fi
-
-          # Try to list ZIP contents
-          if unzip -l "$FILE" > /dev/null 2>&1; then
-            echo "  ✅ Archive is readable."
-            echo "  Contents:"
-            unzip -l "$FILE" | head -20
-          else
-            echo "::warning::[${{ matrix.id }}] Could not list archive contents. May still be valid."
-          fi
-
-      # ── STEP D: Deactivate in target if it exists and is active ──
-      - name: "Pre-import: Deactivate in target if active"
+ 
+      - name: "Pre-import: deactivate in target if active"
         id: pre-import
+        env:
+          TARGET_URL: ${{ needs.validate-environment.outputs.target_url }}
+          TGT_INST: ${{ needs.validate-environment.outputs.target_instance }}
         run: |
-          echo "=========================================="
-          echo "  PRE-IMPORT CHECK IN TARGET"
-          echo "=========================================="
-
-          TARGET_URL="${{ needs.validate-environment.outputs.target_url }}"
           INT_ID="${{ matrix.id }}"
           INT_VER="${{ matrix.version }}"
-          ENCODED="$${INT_ID}%7C$${INT_VER}"
-
+          ENCODED=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]+"|"+sys.argv[2], safe=""))' "$INT_ID" "$INT_VER")
+ 
+          if [ -n "$TGT_INST" ]; then
+            GURL="${TARGET_URL}/integrations/${ENCODED}?integrationInstance=${TGT_INST}"
+          else
+            GURL="${TARGET_URL}/integrations/${ENCODED}"
+          fi
+ 
           HTTP=$(curl -s -o /tmp/tgt_check.json -w "%{http_code}" \
-            --max-time ${{ env.API_TIMEOUT }} \
-            -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
-            -H "Accept: application/json" \
-            "$${TARGET_URL}/integrations/$${ENCODED}")
-
+            --max-time "$API_TIMEOUT" \
+            -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
+            -H "Accept: application/json" "$GURL")
+ 
           if [ "$HTTP" = "200" ]; then
             STATUS=$(jq -r '.status // "UNKNOWN"' /tmp/tgt_check.json)
-            echo "  Integration exists in target. Status: $STATUS"
             echo "exists=true" >> "$GITHUB_OUTPUT"
-
-            if [ "$$STATUS" = "ACTIVATED" ] || [ "$$STATUS" = "ACTIVE" ]; then
-              echo "  Deactivating in target..."
-
-              for i in $$(seq 1 $${{ env.MAX_RETRIES }}); do
+            if [ "$STATUS" = "ACTIVATED" ] || [ "$STATUS" = "ACTIVE" ]; then
+              for i in $(seq 1 "$MAX_RETRIES"); do
+                if [ -n "$TGT_INST" ]; then
+                  PURL="${TARGET_URL}/integrations/${ENCODED}?integrationInstance=${TGT_INST}"
+                else
+                  PURL="${TARGET_URL}/integrations/${ENCODED}"
+                fi
                 D_HTTP=$(curl -s -o /tmp/deact.json -w "%{http_code}" \
-                  --max-time ${{ env.API_TIMEOUT }} \
+                  --max-time "$API_TIMEOUT" \
                   -X POST \
-                  -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
+                  -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
                   -H "Content-Type: application/json" \
                   -H "Accept: application/json" \
                   -H "X-HTTP-Method-Override: PATCH" \
                   -d '{"status":"CONFIGURED"}' \
-                  "$${TARGET_URL}/integrations/$${ENCODED}")
-
+                  "$PURL")
                 case "$D_HTTP" in
-                  200)
-                    echo "  ✅ Deactivated in target."
-                    sleep 15
-                    break
-                    ;;
-                  409)
-                    echo "::warning::[$${{ matrix.id }}] Deactivation conflict (attempt $$i). Waiting..."
-                    sleep 30
-                    [ $$i -eq $${{ env.MAX_RETRIES }} ] && {
-                      echo "::error::❌ [$${{ matrix.id }}] Could not deactivate in target after $${{ env.MAX_RETRIES }} attempts."
-                      cat /tmp/deact.json 2>/dev/null
-                      exit 1
-                    }
-                    ;;
-                  401)
-                    echo "::error::❌ [${{ matrix.id }}] 401 Unauthorized during deactivation."
-                    exit 1
-                    ;;
-                  *)
-                    echo "::error::❌ [$${{ matrix.id }}] Deactivation failed (HTTP $$D_HTTP)."
-                    cat /tmp/deact.json 2>/dev/null
-                    exit 1
-                    ;;
+                  200) sleep 15; break ;;
+                  409) sleep 30; [ "$i" -eq "$MAX_RETRIES" ] && exit 1 ;;
+                  *) cat /tmp/deact.json; exit 1 ;;
                 esac
               done
-            else
-              echo "  Not active — no deactivation needed."
             fi
           elif [ "$HTTP" = "404" ]; then
-            echo "  Integration does not exist in target (fresh import)."
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::[$${{ matrix.id }}] Target check returned HTTP $$HTTP. Proceeding."
             echo "exists=unknown" >> "$GITHUB_OUTPUT"
           fi
-
-      # ── STEP E: Import .iar to target ──
-      - name: "Import: $${{ matrix.id }} v$${{ matrix.version }} → target"
+ 
+      - name: "Import to target"
         id: import
+        env:
+          TARGET_URL: ${{ needs.validate-environment.outputs.target_url }}
+          TGT_INST: ${{ needs.validate-environment.outputs.target_instance }}
         run: |
-          echo "=========================================="
-          echo "  IMPORT: $${{ matrix.id }} v$${{ matrix.version }}"
-          echo "=========================================="
-
-          TARGET_URL="${{ needs.validate-environment.outputs.target_url }}"
           FILE="${{ steps.export.outputs.export_file }}"
           INT_ID="${{ matrix.id }}"
           INT_VER="${{ matrix.version }}"
-          ENCODED="$${INT_ID}%7C$${INT_VER}"
+          ENCODED=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]+"|"+sys.argv[2], safe=""))' "$INT_ID" "$INT_VER")
           EXISTS="${{ steps.pre-import.outputs.exists }}"
-
+ 
+          if [ -n "$TGT_INST" ]; then
+            IURL="${TARGET_URL}/integrations/archive?integrationInstance=${TGT_INST}"
+          else
+            IURL="${TARGET_URL}/integrations/archive"
+          fi
+ 
           SUCCESS=false
-          for i in $$(seq 1 $${{ env.MAX_RETRIES }}); do
-            echo "  Import attempt $$i/$${{ env.MAX_RETRIES }}..."
-
+          for i in $(seq 1 "$MAX_RETRIES"); do
             HTTP=$(curl -s -o /tmp/imp.json -w "%{http_code}" \
               --max-time 300 \
-              -X PUT \
-              -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
+              -X POST \
+              -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
               -H "Accept: application/json" \
               -F "file=@${FILE};type=application/octet-stream" \
-              "${TARGET_URL}/integrations/archive" 2>/tmp/imp_err.txt)
+              "$IURL" 2>/tmp/imp_err.txt)
             EC=$?
-
-            if [ $EC -ne 0 ]; then
-              echo "::warning::[$${{ matrix.id }}] Import curl error (attempt $$i): $(cat /tmp/imp_err.txt)"
-              [ $$i -lt $${{ env.MAX_RETRIES }} ] && sleep ${{ env.RETRY_DELAY }} && continue
-              echo "::error::❌ [$${{ matrix.id }}] Import failed — network error after $${{ env.MAX_RETRIES }} attempts."
+ 
+            if [ "$EC" -ne 0 ]; then
+              echo "::warning::Import curl error: $(cat /tmp/imp_err.txt)"
+              [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
               exit 1
             fi
-
-            echo "  HTTP: $HTTP"
-
+ 
             case "$HTTP" in
-              200|201|204)
-                SUCCESS=true
-                echo "  ✅ Import succeeded (HTTP $HTTP)."
-                break
-                ;;
-              400)
-                echo "::error::❌ [${{ matrix.id }}] Import HTTP 400 Bad Request."
-                echo "  Possible causes:"
-                echo "    • IAR file is corrupt or incompatible with target OIC version"
-                echo "    • Dependent connections/lookups missing in target"
-                echo "    • Integration format version mismatch"
-                echo "  Response:"
-                cat /tmp/imp.json 2>/dev/null
-                exit 1
-                ;;
-              401)
-                echo "::error::❌ [${{ matrix.id }}] Import 401 Unauthorized."
-                exit 1
-                ;;
-              403)
-                echo "::error::❌ [${{ matrix.id }}] Import 403 Forbidden. User lacks import permission."
-                exit 1
-                ;;
+              200|201|204) SUCCESS=true; break ;;
               409)
-                echo "::warning::[${{ matrix.id }}] Import conflict (409). Integration already exists."
-                RESP=$(cat /tmp/imp.json 2>/dev/null || echo "")
-                echo "  Response: $RESP"
-
-                if [ "$$EXISTS" = "true" ] || echo "$$RESP" | grep -qi "already exists\|duplicate"; then
-                  echo "  Deleting existing integration and retrying..."
-
+                RESP=$(cat /tmp/imp.json 2>/dev/null || true)
+                if [ "$EXISTS" = "true" ] || echo "$RESP" | grep -qi "already exists\|duplicate"; then
+                  if [ -n "$TGT_INST" ]; then
+                    DEL_URL="${TARGET_URL}/integrations/${ENCODED}?integrationInstance=${TGT_INST}"
+                  else
+                    DEL_URL="${TARGET_URL}/integrations/${ENCODED}"
+                  fi
                   DEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-                    --max-time ${{ env.API_TIMEOUT }} \
+                    --max-time "$API_TIMEOUT" \
                     -X DELETE \
-                    -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
-                    "$${TARGET_URL}/integrations/$${ENCODED}")
-
-                  if [ "$$DEL_HTTP" = "204" ] || [ "$$DEL_HTTP" = "200" ]; then
-                    echo "  Deleted. Waiting before retry..."
+                    -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
+                    "$DEL_URL")
+                  if [ "$DEL_HTTP" = "204" ] || [ "$DEL_HTTP" = "200" ]; then
                     sleep 15
                     continue
-                  else
-                    echo "::error::❌ [$${{ matrix.id }}] Could not delete existing integration (HTTP $$DEL_HTTP)."
-                    exit 1
                   fi
                 fi
-
-                [ $$i -lt $${{ env.MAX_RETRIES }} ] && sleep ${{ env.RETRY_DELAY }} && continue
-                echo "::error::❌ [${{ matrix.id }}] Import conflict unresolved."
-                exit 1
-                ;;
-              412)
-                echo "::error::❌ [${{ matrix.id }}] Import 412 Precondition Failed. Missing dependencies in target."
+                [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_DELAY" && continue
                 cat /tmp/imp.json 2>/dev/null
                 exit 1
                 ;;
-              413)
-                echo "::error::❌ [${{ matrix.id }}] Import 413 Payload Too Large. IAR file exceeds size limit."
-                exit 1
-                ;;
+              400|401|403|412|413) cat /tmp/imp.json 2>/dev/null; exit 1 ;;
               500|502|503|504)
-                echo "::warning::[$${{ matrix.id }}] Import server error ($$HTTP, attempt $i)."
-                [ $$i -lt $${{ env.MAX_RETRIES }} ] && sleep $(( RETRY_DELAY * i )) && continue
-                echo "::error::❌ [$${{ matrix.id }}] Import server error after $${{ env.MAX_RETRIES }} attempts."
-                cat /tmp/imp.json 2>/dev/null
+                [ "$i" -lt "$MAX_RETRIES" ] && sleep $((RETRY_DELAY * i)) && continue
                 exit 1
                 ;;
-              *)
-                echo "::error::❌ [$${{ matrix.id }}] Import unexpected HTTP $$HTTP."
-                cat /tmp/imp.json 2>/dev/null
-                exit 1
-                ;;
+              *) cat /tmp/imp.json 2>/dev/null; exit 1 ;;
             esac
           done
-
-          [ "$$SUCCESS" != "true" ] && { echo "::error::❌ [$${{ matrix.id }}] Import failed."; exit 1; }
-
-      # ── STEP F: Verify integration exists in target after import ──
-      - name: "Verify: ${{ matrix.id }} in target"
+ 
+          [ "$SUCCESS" = true ] || exit 1
+ 
+      - name: "Verify in target"
+        env:
+          TARGET_URL: ${{ needs.validate-environment.outputs.target_url }}
+          TGT_INST: ${{ needs.validate-environment.outputs.target_instance }}
         run: |
-          echo "=========================================="
-          echo "  POST-IMPORT VERIFICATION"
-          echo "=========================================="
-
-          TARGET_URL="${{ needs.validate-environment.outputs.target_url }}"
           INT_ID="${{ matrix.id }}"
           INT_VER="${{ matrix.version }}"
-          ENCODED="$${INT_ID}%7C$${INT_VER}"
-
+          ENCODED=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]+"|"+sys.argv[2], safe=""))' "$INT_ID" "$INT_VER")
           sleep 10
-          VERIFIED=false
-
           for i in $(seq 1 5); do
-            echo "  Verify attempt $i/5..."
-
-            HTTP=$(curl -s -o /tmp/verify.json -w "%{http_code}" \
-              --max-time ${{ env.API_TIMEOUT }} \
-              -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
-              -H "Accept: application/json" \
-              "$${TARGET_URL}/integrations/$${ENCODED}")
-
-            if [ "$HTTP" = "200" ]; then
-              VERIFIED=true
-              echo "  ✅ [${{ matrix.id }}] Verified in target."
-              jq '{id, name, version, status, pattern}' /tmp/verify.json 2>/dev/null
-              break
+            if [ -n "$TGT_INST" ]; then
+              VURL="${TARGET_URL}/integrations/${ENCODED}?integrationInstance=${TGT_INST}"
+            else
+              VURL="${TARGET_URL}/integrations/${ENCODED}"
             fi
-
-            echo "  Not found yet (HTTP $HTTP). Waiting..."
+            HTTP=$(curl -s -o /tmp/verify.json -w "%{http_code}" \
+              --max-time "$API_TIMEOUT" \
+              -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
+              -H "Accept: application/json" "$VURL")
+            if [ "$HTTP" = "200" ]; then
+              jq '{id, name, version, status, pattern}' /tmp/verify.json 2>/dev/null || true
+              exit 0
+            fi
             sleep 15
           done
-
-          if [ "$VERIFIED" != "true" ]; then
-            echo "::error::❌ [${{ matrix.id }}] Post-import verification FAILED. Integration not found in target after import."
-            exit 1
-          fi
-
-      # ── STEP G: Activate in target if it was active in source ──
-      - name: "Activate: ${{ matrix.id }} (if was active in source)"
-        if: steps.validate-source.outputs.source_status == 'ACTIVATED' || steps.validate-source.outputs.source_status == 'ACTIVE'
+          echo "::error::Post-import verification failed"
+          exit 1
+ 
+      - name: "Activate in target (if active in source)"
+        if: ${{ steps.validate-source.outputs.source_status == 'ACTIVATED' || steps.validate-source.outputs.source_status == 'ACTIVE' }}
+        env:
+          TARGET_URL: ${{ needs.validate-environment.outputs.target_url }}
+          TGT_INST: ${{ needs.validate-environment.outputs.target_instance }}
         run: |
-          echo "=========================================="
-          echo "  ACTIVATE: $${{ matrix.id }} v$${{ matrix.version }}"
-          echo "=========================================="
-
-          TARGET_URL="${{ needs.validate-environment.outputs.target_url }}"
           INT_ID="${{ matrix.id }}"
           INT_VER="${{ matrix.version }}"
-          ENCODED="$${INT_ID}%7C$${INT_VER}"
-
-          # Check if already active
-          CUR_HTTP=$(curl -s -o /tmp/act_chk.json -w "%{http_code}" \
-            --max-time ${{ env.API_TIMEOUT }} \
-            -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
-            -H "Accept: application/json" \
-            "$${TARGET_URL}/integrations/$${ENCODED}")
-
-          if [ "$CUR_HTTP" = "200" ]; then
-            CUR_STATUS=$(jq -r '.status // "UNKNOWN"' /tmp/act_chk.json)
-            if [ "$$CUR_STATUS" = "ACTIVATED" ] || [ "$$CUR_STATUS" = "ACTIVE" ]; then
-              echo "  ✅ Already active. Skipping."
+          ENCODED=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]+"|"+sys.argv[2], safe=""))' "$INT_ID" "$INT_VER")
+ 
+          if [ -n "$TGT_INST" ]; then
+            AURL="${TARGET_URL}/integrations/${ENCODED}?integrationInstance=${TGT_INST}"
+          else
+            AURL="${TARGET_URL}/integrations/${ENCODED}"
+          fi
+ 
+          CUR=$(curl -s -o /tmp/act_chk.json -w "%{http_code}" \
+            --max-time "$API_TIMEOUT" \
+            -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
+            -H "Accept: application/json" "$AURL")
+          if [ "$CUR" = "200" ]; then
+            ST=$(jq -r '.status // ""' /tmp/act_chk.json)
+            if [ "$ST" = "ACTIVATED" ] || [ "$ST" = "ACTIVE" ]; then
+              echo "Already active."
               exit 0
             fi
           fi
-
-          for i in $$(seq 1 $${{ env.MAX_RETRIES }}); do
-            echo "  Activation attempt $$i/$${{ env.MAX_RETRIES }}..."
-
+ 
+          for i in $(seq 1 "$MAX_RETRIES"); do
             A_HTTP=$(curl -s -o /tmp/act.json -w "%{http_code}" \
-              --max-time ${{ env.API_TIMEOUT }} \
+              --max-time "$API_TIMEOUT" \
               -X POST \
-              -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
+              -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
               -H "X-HTTP-Method-Override: PATCH" \
               -d '{"status":"ACTIVATED"}' \
-              "$${TARGET_URL}/integrations/$${ENCODED}")
-
+              "$AURL")
             case "$A_HTTP" in
               200)
-                echo "  Activation request accepted. Waiting for completion..."
                 sleep 30
-
-                # Confirm activation
                 for c in $(seq 1 5); do
                   V_HTTP=$(curl -s -o /tmp/act_v.json -w "%{http_code}" \
-                    --max-time ${{ env.API_TIMEOUT }} \
-                    -u "$${{ secrets.TARGET_OIC_USERNAME }}:$${{ secrets.TARGET_OIC_PASSWORD }}" \
-                    -H "Accept: application/json" \
-                    "$${TARGET_URL}/integrations/$${ENCODED}")
-
+                    --max-time "$API_TIMEOUT" \
+                    -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
+                    -H "Accept: application/json" "$AURL")
                   if [ "$V_HTTP" = "200" ]; then
-                    V_STATUS=$(jq -r '.status // "UNKNOWN"' /tmp/act_v.json)
-                    echo "    Check $$c: status=$$V_STATUS"
-
-                    case "$V_STATUS" in
-                      ACTIVATED|ACTIVE)
-                        echo "  ✅ [${{ matrix.id }}] ACTIVATED in target."
-                        exit 0
-                        ;;
-                      ACTIVATION_IN_PROGRESS)
-                        sleep 20
-                        ;;
-                      ACTIVATION_FAILED)
-                        echo "::error::❌ [${{ matrix.id }}] Activation FAILED in target."
-                        jq '.' /tmp/act_v.json 2>/dev/null
-                        exit 1
-                        ;;
-                      *)
-                        sleep 15
-                        ;;
+                    VS=$(jq -r '.status // ""' /tmp/act_v.json)
+                    case "$VS" in
+                      ACTIVATED|ACTIVE) echo "Activated."; exit 0 ;;
+                      ACTIVATION_FAILED) jq '.' /tmp/act_v.json; exit 1 ;;
                     esac
                   fi
+                  sleep 20
                 done
-                echo "::warning::[${{ matrix.id }}] Activation not confirmed after checks. Please verify manually."
-                break
+                exit 0
                 ;;
-              400)
-                echo "::error::❌ [${{ matrix.id }}] Activation 400 — possible missing connections/config in target."
-                cat /tmp/act.json 2>/dev/null
-                exit 1
-                ;;
-              409)
-                echo "::warning::[$${{ matrix.id }}] Activation conflict (attempt $$i). Waiting..."
-                sleep 30
-                [ $$i -eq $${{ env.MAX_RETRIES }} ] && {
-                  echo "::error::❌ [${{ matrix.id }}] Activation conflict not resolved."
-                  exit 1
-                }
-                ;;
-              *)
-                echo "::error::❌ [$${{ matrix.id }}] Activation HTTP $$A_HTTP."
-                cat /tmp/act.json 2>/dev/null
-                exit 1
-                ;;
+              409) sleep 30; [ "$i" -eq "$MAX_RETRIES" ] && exit 1 ;;
+              *) cat /tmp/act.json; exit 1 ;;
             esac
           done
-
-  ##############################################################################
-  # JOB 4: SUMMARY REPORT
-  ##############################################################################
+ 
   summary:
     name: "4 ─ Migration Summary"
     runs-on: ubuntu-latest
     needs: [validate-environment, discover-integrations, migrate-integration]
     if: always()
-
+ 
     steps:
-      - name: Generate summary
+      - name: Report
         run: |
           echo "=========================================="
           echo "  OIC MIGRATION SUMMARY"
           echo "=========================================="
-          echo ""
-          echo "  Source:             ${{ secrets.SOURCE_OIC_HOST }}"
-          echo "  Target:             ${{ secrets.TARGET_OIC_HOST }}"
+          echo "  Source host:        ${{ secrets.SOURCE_OIC_HOST }}"
+          echo "  Target host:        ${{ secrets.TARGET_OIC_HOST }}"
           echo "  Integrations found: ${{ needs.discover-integrations.outputs.count }}"
-          echo "  Triggered by:       ${{ github.actor }}"
-          echo "  Trigger event:      ${{ github.event_name }}"
-          echo "  Run:                $${{ github.server_url }}/$${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "  Time:               $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "  Actor:              ${{ github.actor }}"
+          echo "  Event:              ${{ github.event_name }}"
+          echo "  Run:                ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "  Time (UTC):         $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           echo ""
-
-          VALIDATE="${{ needs.validate-environment.result }}"
-          DISCOVER="${{ needs.discover-integrations.result }}"
-          MIGRATE="${{ needs.migrate-integration.result }}"
-
-          echo "  Job Results:"
-          echo "    Validate Environment: $VALIDATE"
-          echo "    Discover:             $DISCOVER"
-          echo "    Migrate:              $MIGRATE"
-          echo ""
-
-          if [ "$MIGRATE" = "success" ]; then
-            echo "  ✅ ALL MIGRATIONS COMPLETED SUCCESSFULLY"
-          elif [ "$MIGRATE" = "failure" ]; then
-            echo "  ❌ SOME MIGRATIONS FAILED — check individual job logs"
-          else
-            echo "  ⚠️  Migration status: $MIGRATE"
-          fi
-
-      - name: Write GitHub Step Summary
+          echo "  Validate:  ${{ needs.validate-environment.result }}"
+          echo "  Discover:  ${{ needs.discover-integrations.result }}"
+          echo "  Migrate:   ${{ needs.migrate-integration.result }}"
+ 
+      - name: GitHub Step Summary
         run: |
-          MIGRATE="${{ needs.migrate-integration.result }}"
-          if [ "$MIGRATE" = "success" ]; then
-            STATUS_ICON="✅"
-            STATUS_TEXT="All Migrations Successful"
-          elif [ "$MIGRATE" = "failure" ]; then
-            STATUS_ICON="❌"
-            STATUS_TEXT="Some Migrations Failed"
-          else
-            STATUS_ICON="⚠️"
-            STATUS_TEXT="Status: $MIGRATE"
-          fi
-
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## $STATUS_ICON OIC Integration Migration Report
-
-          | Property | Value |
-          |----------|-------|
-          | **
+          M="${{ needs.migrate-integration.result }}"
+          case "$M" in
+            success) ICON="✅"; TXT="All matrix jobs succeeded" ;;
+            failure) ICON="❌"; TXT="One or more matrix jobs failed — inspect logs" ;;
+            *) ICON="⚠️"; TXT="Migrate result: $M" ;;
+          esac
+          {
+            echo "## ${ICON} OIC migration"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Status | **${TXT}** |"
+            echo "| Integrations discovered | ${{ needs.discover-integrations.outputs.count }} |"
+            echo "| Validate job | ${{ needs.validate-environment.result }} |"
+            echo "| Discover job | ${{ needs.discover-integrations.result }} |"
+            echo "| Migrate job | ${{ needs.migrate-integration.result }} |"
+            echo "| Run | [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
