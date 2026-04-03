@@ -1,6 +1,7 @@
 # .github/workflows/oic-gen3-read-integrations.yml
 
 name: OIC Gen3 - Read All Integrations
+
 # ──────────────────────────────────────────────────────
 # TRIGGERS
 # ──────────────────────────────────────────────────────
