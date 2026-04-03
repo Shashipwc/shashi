@@ -1,0 +1,114 @@
+# .github/workflows/oic-debug.yml
+
+name: OIC Gen3 - DEBUG Auth
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  OIC_HOST: ${{ secrets.OIC_GEN3_HOST }}
+  IDCS_URL: ${{ secrets.IDCS_URL }}
+  CLIENT_ID: ${{ secrets.OIC_CLIENT_ID }}
+  CLIENT_SECRET: ${{ secrets.OIC_CLIENT_SECRET }}
+  OIC_SCOPE: ${{ secrets.OIC_SCOPE }}
+
+jobs:
+  debug:
+    name: Debug IDCS Auth
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq curl
+
+      # ─────────────────────────────────────
+      # DEBUG 1: Print non-sensitive info
+      # ─────────────────────────────────────
+      - name: Debug - Print configuration
+        run: |
+          echo "==========================================="
+          echo "  DEBUG 1: CONFIGURATION"
+          echo "==========================================="
+          echo ""
+          echo "OIC_HOST length: ${#OIC_HOST}"
+          echo "IDCS_URL length: ${#IDCS_URL}"
+          echo "CLIENT_ID length: ${#CLIENT_ID}"
+          echo "CLIENT_SECRET length: ${#CLIENT_SECRET}"
+          echo "OIC_SCOPE length: ${#OIC_SCOPE}"
+          echo ""
+          echo "OIC_HOST starts with: $$(echo $${OIC_HOST} | cut -c1-8)"
+          echo "IDCS_URL starts with: $$(echo $${IDCS_URL} | cut -c1-8)"
+          echo ""
+          echo "OIC_HOST last 5 chars: $$(echo $${OIC_HOST} | tail -c 6)"
+          echo "IDCS_URL last 5 chars: $$(echo $${IDCS_URL} | tail -c 6)"
+          echo "OIC_SCOPE last 10 chars: $$(echo $${OIC_SCOPE} | tail -c 11)"
+          echo ""
+          echo "Any hidden whitespace in OIC_HOST?"
+          echo "${OIC_HOST}" | cat -A
+          echo ""
+          echo "Any hidden whitespace in IDCS_URL?"
+          echo "${IDCS_URL}" | cat -A
+          echo ""
+          echo "Any hidden whitespace in OIC_SCOPE?"
+          echo "${OIC_SCOPE}" | cat -A
+          echo ""
+          echo "Any hidden whitespace in CLIENT_ID?"
+          echo "${CLIENT_ID}" | cat -A
+          echo ""
+          echo "Any hidden whitespace in CLIENT_SECRET?"
+          echo "${CLIENT_SECRET}" | cat -A
+
+      # ─────────────────────────────────────
+      # DEBUG 2: Check IDCS OpenID config
+      # ─────────────────────────────────────
+      - name: Debug - IDCS OpenID Configuration
+        run: |
+          echo "==========================================="
+          echo "  DEBUG 2: IDCS OPENID CONFIG"
+          echo "==========================================="
+
+          RESPONSE=$(curl -s -L --connect-timeout 15 \
+            "${IDCS_URL}/.well-known/openid-configuration")
+
+          echo "Token endpoint:"
+          echo "$RESPONSE" | jq -r '.token_endpoint // "NOT FOUND"'
+
+          echo ""
+          echo "Issuer:"
+          echo "$RESPONSE" | jq -r '.issuer // "NOT FOUND"'
+
+          echo ""
+          echo "Scopes supported:"
+          echo "$RESPONSE" | jq -r '.scopes_supported // ["NOT FOUND"]'
+
+          echo ""
+          echo "Grant types supported:"
+          echo "$RESPONSE" | jq -r '.grant_types_supported // ["NOT FOUND"]'
+
+          # Save token endpoint for next step
+          TOKEN_ENDPOINT=$$(echo "$$RESPONSE" | jq -r '.token_endpoint // empty')
+          echo "token_endpoint=$${TOKEN_ENDPOINT}" >> $$GITHUB_ENV
+
+      # ─────────────────────────────────────
+      # DEBUG 3: Try token with discovered endpoint
+      # ─────────────────────────────────────
+      - name: Debug - Try with discovered token endpoint
+        run: |
+          echo "==========================================="
+          echo "  DEBUG 3: USING DISCOVERED TOKEN ENDPOINT"
+          echo "==========================================="
+
+          # Use the token endpoint from OpenID config
+          if [ -n "${token_endpoint}" ]; then
+            echo "Using discovered endpoint: ${token_endpoint}"
+            ENDPOINT="${token_endpoint}"
+          else
+            echo "Using constructed endpoint: ${IDCS_URL}/oauth2/v1/token"
+            ENDPOINT="${IDCS_URL}/oauth2/v1/token"
+          fi
+
+          echo ""
+          echo "─── Test A: client_credentials with scope ───"
+          RESPONSE=$(curl -s -L -
