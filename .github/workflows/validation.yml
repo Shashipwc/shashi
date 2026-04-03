@@ -1,0 +1,588 @@
+# .github/workflows/oic-gen3-read-integrations.yml
+
+name: OIC Gen3 - Read All Integrations
+
+# ──────────────────────────────────────────────────────
+# TRIGGERS
+# ──────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 8 * * *'
+
+# ──────────────────────────────────────────────────────
+# SECRETS REFERENCED
+# ──────────────────────────────────────────────────────
+# OIC_GEN3_HOST     → https://instancename-tenantid.integration.region.ocp.oraclecloud.com
+# IDCS_URL          → https://idcs-xxxxxx.identity.oraclecloud.com
+# OIC_CLIENT_ID     → Confidential App Client ID
+# OIC_CLIENT_SECRET → Confidential App Client Secret
+# OIC_SCOPE         → https://instancename-tenantid.integration.region.ocp.oraclecloud.com:443urn:opc:resource:consumer::all
+# ──────────────────────────────────────────────────────
+
+env:
+  OIC_HOST: ${{ secrets.OIC_GEN3_HOST }}
+  IDCS_URL: ${{ secrets.IDCS_URL }}
+  CLIENT_ID: ${{ secrets.OIC_CLIENT_ID }}
+  CLIENT_SECRET: ${{ secrets.OIC_CLIENT_SECRET }}
+  OIC_SCOPE: ${{ secrets.OIC_SCOPE }}
+
+jobs:
+  read-integrations:
+    name: Read All Integrations from OIC Gen3
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ═══════════════════════════════════════════
+      # STEP 0: Checkout & Install Tools
+      # ═══════════════════════════════════════════
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq and curl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl
+          echo "jq version: $(jq --version)"
+          echo "curl version: $(curl --version | head -1)"
+
+      # ═══════════════════════════════════════════
+      # STEP 1: Validate All Secrets Exist
+      # ═══════════════════════════════════════════
+      - name: Validate secrets are configured
+        run: |
+          echo "==========================================="
+          echo "  STEP 1: VALIDATING SECRETS"
+          echo "==========================================="
+
+          MISSING=0
+
+          if [ -z "${OIC_HOST}" ]; then
+            echo "❌ OIC_GEN3_HOST secret is MISSING"
+            MISSING=1
+          else
+            echo "✅ OIC_GEN3_HOST is set"
+          fi
+
+          if [ -z "${IDCS_URL}" ]; then
+            echo "❌ IDCS_URL secret is MISSING"
+            MISSING=1
+          else
+            echo "✅ IDCS_URL is set"
+          fi
+
+          if [ -z "${CLIENT_ID}" ]; then
+            echo "❌ OIC_CLIENT_ID secret is MISSING"
+            MISSING=1
+          else
+            echo "✅ OIC_CLIENT_ID is set"
+          fi
+
+          if [ -z "${CLIENT_SECRET}" ]; then
+            echo "❌ OIC_CLIENT_SECRET secret is MISSING"
+            MISSING=1
+          else
+            echo "✅ OIC_CLIENT_SECRET is set"
+          fi
+
+          if [ -z "${OIC_SCOPE}" ]; then
+            echo "❌ OIC_SCOPE secret is MISSING"
+            MISSING=1
+          else
+            echo "✅ OIC_SCOPE is set"
+          fi
+
+          if [ "$MISSING" -eq 1 ]; then
+            echo ""
+            echo "============================================="
+            echo "  HOW TO FIX:"
+            echo "  Go to: Repo → Settings → Secrets and"
+            echo "  variables → Actions → New repository secret"
+            echo "============================================="
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ All 5 secrets are configured"
+
+      # ═══════════════════════════════════════════
+      # STEP 2: Validate URL Formats
+      # ═══════════════════════════════════════════
+      - name: Validate URL formats
+        run: |
+          echo "==========================================="
+          echo "  STEP 2: VALIDATING URL FORMATS"
+          echo "==========================================="
+
+          ERROR=0
+
+          # Check OIC_HOST format
+          if [[ ! "${OIC_HOST}" =~ ^https:// ]]; then
+            echo "❌ OIC_GEN3_HOST must start with https://"
+            ERROR=1
+          else
+            echo "✅ OIC_GEN3_HOST starts with https://"
+          fi
+
+          if [[ "${OIC_HOST}" == */ ]]; then
+            echo "❌ OIC_GEN3_HOST must NOT end with trailing slash /"
+            echo "   Current: ${OIC_HOST}"
+            echo "   Fix:     Remove the trailing /"
+            ERROR=1
+          else
+            echo "✅ OIC_GEN3_HOST has no trailing slash"
+          fi
+
+          if [[ "${OIC_HOST}" == */ic/home* ]]; then
+            echo "❌ OIC_GEN3_HOST must NOT contain /ic/home"
+            echo "   Current: ${OIC_HOST}"
+            echo "   Fix:     Remove /ic/home/ from the end"
+            ERROR=1
+          else
+            echo "✅ OIC_GEN3_HOST does not contain /ic/home"
+          fi
+
+          # Check IDCS_URL format
+          if [[ ! "${IDCS_URL}" =~ ^https:// ]]; then
+            echo "❌ IDCS_URL must start with https://"
+            ERROR=1
+          else
+            echo "✅ IDCS_URL starts with https://"
+          fi
+
+          if [[ "${IDCS_URL}" == */ ]]; then
+            echo "❌ IDCS_URL must NOT end with trailing slash /"
+            ERROR=1
+          else
+            echo "✅ IDCS_URL has no trailing slash"
+          fi
+
+          # Check SCOPE format
+          if [[ ! "${OIC_SCOPE}" =~ :443urn:opc:resource:consumer::all ]]; then
+            echo "⚠️  WARNING: OIC_SCOPE may be incorrect"
+            echo "   Expected format: https://<oic-host>:443urn:opc:resource:consumer::all"
+            echo "   Note: NO space between :443 and urn:"
+          else
+            echo "✅ OIC_SCOPE format looks correct"
+          fi
+
+          if [ "$ERROR" -eq 1 ]; then
+            echo ""
+            echo "❌ Fix the above errors in your GitHub Secrets"
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ All URL formats are valid"
+
+      # ═══════════════════════════════════════════
+      # STEP 3: Test IDCS Reachability
+      # ═══════════════════════════════════════════
+      - name: Test IDCS reachability
+        run: |
+          echo "==========================================="
+          echo "  STEP 3: TESTING IDCS REACHABILITY"
+          echo "==========================================="
+
+          HTTP_CODE=$(curl -s -L -o /dev/null -w "%{http_code}" \
+            --connect-timeout 15 \
+            --max-time 30 \
+            "${IDCS_URL}/.well-known/openid-configuration")
+
+          echo "IDCS Health Check HTTP: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ IDCS is reachable"
+          elif [ "$HTTP_CODE" -eq 000 ]; then
+            echo "❌ Cannot reach IDCS — DNS or network issue"
+            echo "   Check IDCS_URL: ${IDCS_URL}"
+            exit 1
+          else
+            echo "⚠️  IDCS returned HTTP $HTTP_CODE (may still work)"
+          fi
+
+      # ═══════════════════════════════════════════
+      # STEP 4: Test OIC Host Reachability
+      # ═══════════════════════════════════════════
+      - name: Test OIC host reachability
+        run: |
+          echo "==========================================="
+          echo "  STEP 4: TESTING OIC HOST REACHABILITY"
+          echo "==========================================="
+
+          HTTP_CODE=$(curl -s -L -o /dev/null -w "%{http_code}" \
+            --connect-timeout 15 \
+            --max-time 30 \
+            "${OIC_HOST}/ic/home/")
+
+          echo "OIC Host HTTP: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 302 ] || [ "$HTTP_CODE" -eq 301 ] || [ "$HTTP_CODE" -eq 307 ]; then
+            echo "✅ OIC host is reachable"
+          elif [ "$HTTP_CODE" -eq 000 ]; then
+            echo "❌ Cannot reach OIC — DNS or network issue"
+            echo "   Check OIC_GEN3_HOST: ${OIC_HOST}"
+            exit 1
+          else
+            echo "⚠️  OIC returned HTTP $HTTP_CODE (may still work for API calls)"
+          fi
+
+      # ═══════════════════════════════════════════
+      # STEP 5: Obtain OAuth2 Access Token
+      # ═══════════════════════════════════════════
+      - name: Obtain OAuth2 access token from IDCS
+        id: auth
+        run: |
+          echo "==========================================="
+          echo "  STEP 5: OBTAINING OAUTH2 TOKEN"
+          echo "==========================================="
+
+          TOKEN_RESPONSE=$(curl -s -L -w "\n%{http_code}" \
+            --connect-timeout 15 \
+            --max-time 30 \
+            -X POST \
+            -u "${CLIENT_ID}:${CLIENT_SECRET}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&scope=${OIC_SCOPE}" \
+            "${IDCS_URL}/oauth2/v1/token")
+
+          HTTP_CODE=$(echo "$TOKEN_RESPONSE" | tail -n1)
+          BODY=$(echo "$TOKEN_RESPONSE" | sed '$d')
+
+          echo "Token Endpoint HTTP: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            ACCESS_TOKEN=$(echo "$BODY" | jq -r '.access_token // empty')
+            TOKEN_TYPE=$(echo "$BODY" | jq -r '.token_type // "N/A"')
+            EXPIRES_IN=$(echo "$BODY" | jq -r '.expires_in // "N/A"')
+
+            if [ -z "$ACCESS_TOKEN" ]; then
+              echo "❌ Token response is 200 but access_token is empty"
+              echo "Response:"
+              echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+              exit 1
+            fi
+
+            echo "::add-mask::$ACCESS_TOKEN"
+            echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+            echo "✅ OAuth2 token obtained successfully"
+            echo "   Token Type : $TOKEN_TYPE"
+            echo "   Expires In : ${EXPIRES_IN}s"
+
+          elif [ "$HTTP_CODE" -eq 401 ]; then
+            echo "❌ 401 Unauthorized from IDCS"
+            echo ""
+            echo "POSSIBLE CAUSES:"
+            echo "  1. OIC_CLIENT_ID is wrong"
+            echo "  2. OIC_CLIENT_SECRET is wrong"
+            echo "  3. Confidential App is not ACTIVATED in IDCS"
+            echo ""
+            echo "Response:"
+            echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+            exit 1
+
+          elif [ "$HTTP_CODE" -eq 400 ]; then
+            echo "❌ 400 Bad Request from IDCS"
+            echo ""
+            echo "POSSIBLE CAUSES:"
+            echo "  1. OIC_SCOPE format is wrong"
+            echo "     Expected: https://<oic-host>:443urn:opc:resource:consumer::all"
+            echo "     Note: NO space between :443 and urn:"
+            echo "  2. Scope not assigned to the IDCS app"
+            echo ""
+            echo "Response:"
+            echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+            exit 1
+
+          elif [ "$HTTP_CODE" -eq 404 ]; then
+            echo "❌ 404 Not Found"
+            echo "   IDCS_URL may be wrong: ${IDCS_URL}"
+            echo "   Expected format: https://idcs-xxxxx.identity.oraclecloud.com"
+            exit 1
+
+          else
+            echo "❌ Unexpected HTTP $HTTP_CODE from IDCS"
+            echo "Response:"
+            echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+            exit 1
+          fi
+
+      # ═══════════════════════════════════════════
+      # STEP 6: Validate Token Against OIC API
+      # ═══════════════════════════════════════════
+      - name: Validate token against OIC API
+        run: |
+          echo "==========================================="
+          echo "  STEP 6: VALIDATING TOKEN AGAINST OIC API"
+          echo "==========================================="
+
+          RESPONSE=$(curl -s -L -w "\n%{http_code}" \
+            --connect-timeout 15 \
+            --max-time 30 \
+            -X GET \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.token }}" \
+            -H "Accept: application/json" \
+            "${OIC_HOST}/ic/api/integration/v1/integrations?limit=1")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "OIC API HTTP: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Token is valid — OIC API returned 200"
+
+          elif [ "$HTTP_CODE" -eq 401 ]; then
+            echo "❌ 401 Unauthorized from OIC API"
+            echo ""
+            echo "POSSIBLE CAUSES:"
+            echo "  1. OIC_SCOPE is wrong — must match your OIC instance"
+            echo "  2. IDCS app does not have OIC resource scope"
+            echo "  3. Token was issued but not valid for this OIC instance"
+            echo ""
+            echo "YOUR SCOPE: ${OIC_SCOPE}"
+            echo "EXPECTED:   https://<your-oic-host>:443urn:opc:resource:consumer::all"
+            echo ""
+            echo "Response:"
+            echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+            exit 1
+
+          elif [ "$HTTP_CODE" -eq 403 ]; then
+            echo "❌ 403 Forbidden from OIC API"
+            echo ""
+            echo "POSSIBLE CAUSES:"
+            echo "  1. IDCS app user needs ServiceAdministrator or ServiceDeveloper role"
+            echo "  2. Go to IDCS → Application → App Roles → Assign OIC roles"
+            echo ""
+            echo "Response:"
+            echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+            exit 1
+
+          elif [ "$HTTP_CODE" -eq 307 ]; then
+            echo "❌ 307 Redirect from OIC"
+            echo ""
+            echo "POSSIBLE CAUSES:"
+            echo "  1. OIC_GEN3_HOST URL needs to be the design-time URL"
+            echo "  2. Try: https://design.integration.<region>.ocp.oraclecloud.com"
+            echo ""
+            REDIRECT_URL=$(curl -s -o /dev/null -w "%{redirect_url}" \
+              -H "Authorization: Bearer ${{ steps.auth.outputs.token }}" \
+              -H "Accept: application/json" \
+              "${OIC_HOST}/ic/api/integration/v1/integrations?limit=1")
+            echo "Redirect target: $REDIRECT_URL"
+            exit 1
+
+          elif [ "$HTTP_CODE" -eq 404 ]; then
+            echo "❌ 404 Not Found"
+            echo "   API path may be wrong. Check OIC_GEN3_HOST"
+            exit 1
+
+          else
+            echo "❌ Unexpected HTTP $HTTP_CODE"
+            echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+            exit 1
+          fi
+
+      # ═══════════════════════════════════════════
+      # STEP 7: Fetch All Integrations (Paginated)
+      # ═══════════════════════════════════════════
+      - name: Fetch all integrations
+        id: fetch
+        run: |
+          echo "==========================================="
+          echo "  STEP 7: FETCHING ALL INTEGRATIONS"
+          echo "==========================================="
+
+          ACCESS_TOKEN="${{ steps.auth.outputs.token }}"
+          HAS_MORE=true
+          OFFSET=0
+          LIMIT=100
+          ALL_INTEGRATIONS="[]"
+          PAGE=1
+
+          while [ "$HAS_MORE" = "true" ]; do
+
+            echo "  Page $PAGE (offset: $OFFSET)..."
+
+            RESPONSE=$(curl -s -L -w "\n%{http_code}" \
+              --connect-timeout 15 \
+              --max-time 60 \
+              -X GET \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+              -H "Accept: application/json" \
+              "${OIC_HOST}/ic/api/integration/v1/integrations?limit=${LIMIT}&offset=${OFFSET}&onlyData=true")
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "❌ Failed at page $PAGE (offset $OFFSET). HTTP: $HTTP_CODE"
+              echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+              exit 1
+            fi
+
+            ITEMS=$(echo "$BODY" | jq '.items // []')
+            COUNT=$(echo "$ITEMS" | jq 'length')
+
+            echo "  → Got $COUNT integrations"
+
+            ALL_INTEGRATIONS=$(echo "$ALL_INTEGRATIONS $ITEMS" | jq -s 'add')
+
+            if [ "$COUNT" -lt "$LIMIT" ]; then
+              HAS_MORE=false
+            else
+              OFFSET=$((OFFSET + LIMIT))
+              PAGE=$((PAGE + 1))
+              sleep 1
+            fi
+
+          done
+
+          TOTAL=$(echo "$ALL_INTEGRATIONS" | jq 'length')
+
+          # Save outputs
+          mkdir -p output
+
+          # Full JSON
+          echo "$ALL_INTEGRATIONS" | jq '.' > output/integrations.json
+
+          # CSV
+          echo "Integration_ID,Version,Status,Pattern,Description,Last_Updated,Created_By" > output/integrations.csv
+          echo "$ALL_INTEGRATIONS" | jq -r '
+            .[] |
+            [
+              .id,
+              .version,
+              .status,
+              (.patternDescription // "N/A"),
+              ((.description // "N/A") | gsub(","; " ") | gsub("\n"; " ")),
+              (.timeUpdated // "N/A"),
+              (.createdBy // "N/A")
+            ] | @csv
+          ' >> output/integrations.csv
+
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "✅ Fetched $TOTAL integrations successfully"
+
+      # ═══════════════════════════════════════════
+      # STEP 8: Display Formatted Results
+      # ═══════════════════════════════════════════
+      - name: Display integration list
+        run: |
+          TOTAL=${{ steps.fetch.outputs.total }}
+
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║                        OIC Gen3 — ALL INTEGRATIONS                                    ║"
+          echo "║                           Total: ${TOTAL} integrations                                     ║"
+          echo "╚════════════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # ── Table Header ──
+          printf "┌──────┬──────────────────────────────────────────────────┬───────────────┬──────────────┬──────────────────┐\n"
+          printf "│ %-4s │ %-48s │ %-13s │ %-12s │ %-16s │\n" "No." "Integration ID" "Version" "Status" "Pattern"
+          printf "├──────┼──────────────────────────────────────────────────┼───────────────┼──────────────┼──────────────────┤\n"
+
+          # ── Table Rows ──
+          INDEX=1
+          cat output/integrations.json | jq -r '
+            .[] | "\(.id)|\(.version)|\(.status)|\(.patternDescription // "N/A")"
+          ' | while IFS='|' read -r ID VERSION STATUS PATTERN; do
+            printf "│ %-4s │ %-48s │ %-13s │ %-12s │ %-16s │\n" "$INDEX" "$ID" "$VERSION" "$STATUS" "$PATTERN"
+            INDEX=$((INDEX + 1))
+          done
+
+          printf "└──────┴──────────────────────────────────────────────────┴───────────────┴──────────────┴──────────────────┘\n"
+
+          # ── Status Summary ──
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  STATUS SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          cat output/integrations.json | jq -r '
+            group_by(.status) | .[] |
+            "  \(.[0].status): \(length)"
+          '
+
+          # ── Pattern Summary ──
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  PATTERN SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          cat output/integrations.json | jq -r '
+            group_by(.patternDescription // "Unknown") | .[] |
+            "  \(.[0].patternDescription // "Unknown"): \(length)"
+          '
+
+          # ── Recently Updated ──
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  LAST 5 UPDATED"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          cat output/integrations.json | jq -r '
+            sort_by(.timeUpdated) | reverse | .[:5] | .[] |
+            "  \(.id) v\(.version) — \(.timeUpdated // "N/A")"
+          '
+
+      # ═══════════════════════════════════════════
+      # STEP 9: Write GitHub Job Summary (Markdown)
+      # ═══════════════════════════════════════════
+      - name: Write GitHub job summary
+        if: always()
+        run: |
+          TOTAL=${{ steps.fetch.outputs.total }}
+
+          {
+            echo "## 📋 OIC Gen3 Integration Report"
+            echo ""
+            echo "| Detail | Value |"
+            echo "|--------|-------|"
+            echo "| **Environment** | \`${{ env.OIC_HOST }}\` |"
+            echo "| **Total Integrations** | **${TOTAL}** |"
+            echo "| **Run Date** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
+            echo "| **Run Number** | #${{ github.run_number }} |"
+            echo ""
+
+            # Status summary table
+            echo "### Status Summary"
+            echo "| Status | Count |"
+            echo "|--------|-------|"
+            cat output/integrations.json | jq -r '
+              group_by(.status) | .[] |
+              "| \(.[0].status) | \(length) |"
+            '
+            echo ""
+
+            # Full integration list
+            echo "### All Integrations"
+            echo "| # | Integration ID | Version | Status | Pattern |"
+            echo "|---|---------------|---------|--------|---------|"
+
+            INDEX=1
+            cat output/integrations.json | jq -r '
+              .[] | "\(.id)|\(.version)|\(.status)|\(.patternDescription // "N/A")"
+            ' | while IFS='|' read -r ID VERSION STATUS PATTERN; do
+              echo "| $INDEX | \`$ID\` | $VERSION | $STATUS | $PATTERN |"
+              INDEX=$((INDEX + 1))
+            done
+
+          } >> $GITHUB_STEP_SUMMARY
+
+      # ═══════════════════════════════════════════
+      # STEP 10: Upload Artifacts (JSON + CSV)
+      # ═══════════════════════════════════════════
+      - name: Upload integration reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oic-gen3-integrations-${{ github.run_number }}
+          path: |
+            output/integrations.json
+            output/integrations.csv
+          retention-days: 30
