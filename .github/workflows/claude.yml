@@ -118,7 +118,7 @@ jobs:
           fi
  
           for i in $(seq 1 "$MAX_RETRIES"); do
-            HTTP=$(curl -s -o /tmp/src.json -w "%{http_code}" \
+            HTTP=$(curl -s -L -o /tmp/src.json -w "%{http_code}" \
               --max-time "$API_TIMEOUT" \
               -u "${{ secrets.SOURCE_OIC_USERNAME }}:${{ secrets.SOURCE_OIC_PASSWORD }}" \
               -H "Accept: application/json" "$URL" 2>/tmp/src_err.txt)
@@ -165,7 +165,7 @@ jobs:
           fi
  
           for i in $(seq 1 "$MAX_RETRIES"); do
-            HTTP=$(curl -s -o /tmp/tgt.json -w "%{http_code}" \
+            HTTP=$(curl -s -L -o /tmp/tgt.json -w "%{http_code}" \
               --max-time "$API_TIMEOUT" \
               -u "${{ secrets.TARGET_OIC_USERNAME }}:${{ secrets.TARGET_OIC_PASSWORD }}" \
               -H "Accept: application/json" "$URL" 2>/tmp/tgt_err.txt)
